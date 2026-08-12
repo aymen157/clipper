@@ -1,10 +1,12 @@
-
 from __future__ import annotations
 
 import subprocess
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple, Union, TypeVar
+import math
+import queue
+import functools
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import av
 
 class Clip:
@@ -33,6 +35,28 @@ class Clip:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+class PixelClip(Clip):
+    """Class representing a visual clip with spatial dimensions and an optional alpha mask clip."""
+
+    def __init__(
+        self,
+        get_frame: Callable[[float], np.ndarray],
+        duration: float,
+        width: int,
+        height: int,
+        alpha: Optional[Clip] = None,
+    ):
+        super().__init__(get_frame=get_frame, duration=duration)
+        self.width = int(width)
+        self.height = int(height)
+        self.alpha = alpha
+
+    def close(self):
+        super().close()
+        if self.alpha is not None:
+            self.alpha.close()
 
 
 class AudioClip:
@@ -71,7 +95,7 @@ class AudioClip:
         self.close()
 
 
-def single_color_clip(color: Tuple[int, int, int], width: int, height: int, duration: float) -> Clip:
+def single_color_clip(color: Tuple[int, int, int], width: int, height: int, duration: float) -> PixelClip:
     """
     Create a Clip that displays a solid color for the given duration.
     
@@ -87,9 +111,11 @@ def single_color_clip(color: Tuple[int, int, int], width: int, height: int, dura
     # Precompute the constant frame once
     frame = np.full((height, width, 3), color, dtype=np.uint8)
 
-    return Clip(
+    return PixelClip(
         get_frame=lambda t: frame,
-        duration=duration
+        duration=duration,
+        width=width,
+        height=height,
     )
 
 
@@ -114,22 +140,31 @@ def mask_clip(value: int, width: int, height: int, duration: float) -> Clip:
     )
 
 
-
-def image_file_clip(image_path: str, duration: float) -> Clip:
+def image_file_clip(image_path: str, duration: float) -> PixelClip:
     """Creates a clip backed by a static image file repeated over a set duration."""
     with Image.open(image_path) as img:
-        frame = np.array(img.convert('RGB'))
+        img_rgba = img.convert('RGBA')
+        frame_rgba = np.array(img_rgba)
 
-    def make_frame(t: float) -> np.ndarray:
-        return frame
+    rgb_frame = frame_rgba[:, :, :3]
+    alpha_frame = frame_rgba[:, :, 3]
 
-    clip = Clip(get_frame=make_frame, duration=duration)
-    clip.height, clip.width, _ = frame.shape
+    height, width, _ = rgb_frame.shape
+
+    alpha_c = Clip(get_frame=lambda t: alpha_frame, duration=duration)
+
+    clip = PixelClip(
+        get_frame=lambda t: rgb_frame,
+        duration=duration,
+        width=width,
+        height=height,
+        alpha=alpha_c
+    )
     clip.image_path = image_path
     return clip
 
 
-def video_file_clip(file_path: str) -> Clip:
+def video_file_clip(file_path: str) -> PixelClip:
     """Memory-efficient, stateful VideoClip using persistent PyAV demuxer."""
     container = av.open(file_path)
     stream = container.streams.video[0]
@@ -177,10 +212,8 @@ def video_file_clip(file_path: str) -> Clip:
             container.close()
 
     frame_reader = VideoFrameReader()
-    clip = Clip(get_frame=frame_reader, duration=duration)
+    clip = PixelClip(get_frame=frame_reader, duration=duration, width=width, height=height)
     clip.file_path = file_path
-    clip.width = width
-    clip.height = height
     return clip
 
 
@@ -254,11 +287,6 @@ def audio_file_clip(file_path: str, sample_rate: int = 44100, channels: int = 2)
     audio_clip.file_path = file_path
     return audio_clip
 
-import math
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from typing import Callable, Union, Tuple, Optional, TypeVar
-import functools
 
 T = TypeVar('T')
 ValueOrCallable = Union[T, Callable[[float], T]]
@@ -280,6 +308,8 @@ def _get_font(font_path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
             continue
     return ImageFont.load_default()
 
+from functools import lru_cache
+
 def text_clip(
     text: ValueOrCallable[str],
     duration: float,
@@ -295,21 +325,27 @@ def text_clip(
     glow_color: Optional[ValueOrCallable[Tuple[int, int, int]]] = None,
     glow_radius: float = 0.0,
     size: Tuple[int, int] = (1920, 1080),
-) -> "Clip":
+    x: float = 0.0,
+    y: float = 0.0,
+    pivot_x: float = 0.5,
+    pivot_y: float = 0.5,
+    crop_to_content: bool = True,   # NEW: skip full-canvas rendering
+) -> PixelClip:
 
-    # Detect if text changes over time (e.g. countdown timer) vs static string
     sample_text_0 = str(resolve_val(text, 0.0))
     sample_text_1 = str(resolve_val(text, 0.5))
     is_text_dynamic = callable(text) and (sample_text_0 != sample_text_1)
 
-    # Base render size for pre-baked high-res sprite (eliminates font hinting jitter)
+    # NEW: the *whole rendered frame* is static (not just the text) only if
+    # every visual parameter is either non-callable, or callable but constant.
+    is_frame_dynamic = is_text_dynamic or any(
+        callable(v) for v in (font_size, color, outline_color, outline_width, glow_color)
+    )
+
     BASE_RENDER_SIZE = 160
-    
-    # Pre-render cache for static text strings
     _static_cache = {}
 
     def get_baked_text_sprite(txt: str, out_w: int, out_c: Optional[Tuple[int, int, int]]):
-        """Renders high-res text sprite ONCE and caches it."""
         cache_key = (txt, out_w, out_c)
         if cache_key in _static_cache:
             return _static_cache[cache_key]
@@ -325,7 +361,6 @@ def text_clip(
         tx = pad - bbox[0]
         ty = pad - bbox[1]
 
-        # 1. Base Text Sprite
         sprite = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         draw = ImageDraw.Draw(sprite)
         draw.text(
@@ -337,15 +372,12 @@ def text_clip(
             stroke_fill=(255, 255, 255, 255) if out_c else None
         )
 
-        # 2. Glow Alpha Map (Pre-calculated Gaussian blur)
         glow_sprite = None
         if glow_radius > 0:
             alpha = sprite.split()[3]
-            # Boost alpha intensity so glow pops nicely
             alpha = alpha.point(lambda p: min(255, p * 2.5))
             glow_sprite = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
             glow_sprite.paste((255, 255, 255, 255), (0, 0), mask=alpha)
-            # Blur once during baking
             glow_sprite = glow_sprite.filter(ImageFilter.GaussianBlur(radius=glow_radius * 1.5))
 
         res = (sprite, glow_sprite, sw, sh)
@@ -353,69 +385,105 @@ def text_clip(
             _static_cache[cache_key] = res
         return res
 
-    def make_frame(t: float) -> np.ndarray:
+    # Bump maxsize a bit — cheap insurance for scrubbing/seeking, still tiny.
+    @lru_cache(maxsize=64)
+    def render_time_cached(t_key: int) -> np.ndarray:
+        t = t_key / 10000.0
+
         cur_text = str(resolve_val(text, t))
         target_size = float(resolve_val(font_size, t))
         cur_color = resolve_val(color, t)
         cur_outline_color = resolve_val(outline_color, t) if outline_color else None
         cur_outline_width = int(resolve_val(outline_width, t))
-        cur_shadow_color = resolve_val(shadow_color, t) if shadow_color else None
         cur_glow_color = resolve_val(glow_color, t) if glow_color else None
 
-        # Fetch pre-rendered sprite
         text_sprite, glow_sprite, sw, sh = get_baked_text_sprite(
             cur_text, cur_outline_width, cur_outline_color
         )
 
-        # Scale Factor relative to base render resolution
         scale = target_size / BASE_RENDER_SIZE
         new_w = max(1, int(sw * scale))
         new_h = max(1, int(sh * scale))
 
-        # Base Frame Canvas
-        canvas = Image.new("RGBA", size, bg_color + (255,))
-        cx = (size[0] - new_w) // 2
-        cy = (size[1] - new_h) // 2
+        text_box = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
 
-        # Fast Resampling via Lanczos (Zero Font Hinting Jitter)
-        # --- Layer 1: Glow ---
         if cur_glow_color and glow_sprite:
             scaled_glow = glow_sprite.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
             glow_colored = Image.new("RGBA", (new_w, new_h), cur_glow_color + (255,))
-            canvas.paste(glow_colored, (cx, cy), mask=scaled_glow.split()[3])
+            text_box.paste(glow_colored, (0, 0), mask=scaled_glow.split()[3])
 
-        # --- Layer 2: Main Text ---
         scaled_text = text_sprite.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
         text_colored = Image.new("RGBA", (new_w, new_h), cur_color + (255,))
-        canvas.paste(text_colored, (cx, cy), mask=scaled_text.split()[3])
+        text_box.paste(text_colored, (0, 0), mask=scaled_text.split()[3])
 
-        return np.array(canvas.convert("RGB"), dtype=np.uint8)
+        # NOTE: no more full-canvas np.zeros((1080,1920,4)) here.
+        # We just return the tight box. blend_clips positions it.
+        return np.array(text_box, dtype=np.uint8)
 
-    sample_frame = make_frame(0.0)
-    clip = Clip(get_frame=make_frame, duration=duration)
-    clip.height, clip.width, _ = sample_frame.shape
-    return clip
+    _static_box = None  # NEW: memoized fully-static result
 
+    def make_rgba_box(t: float) -> np.ndarray:
+        nonlocal _static_box
+        if not is_frame_dynamic and _static_box is not None:
+            return _static_box
+        t_key = int(round(t * 10000))
+        box = render_time_cached(t_key)
+        if not is_frame_dynamic:
+            _static_box = box
+        return box
 
+    if crop_to_content:
+        def make_rgb_frame(t: float) -> np.ndarray:
+            return make_rgba_box(t)[:, :, :3]
 
+        def make_alpha_frame(t: float) -> np.ndarray:
+            return make_rgba_box(t)[:, :, 3]
 
+        sample = make_rgba_box(0.0)  # for declared width/height metadata only
+        alpha_clip_obj = Clip(get_frame=make_alpha_frame, duration=duration)
+        clip = PixelClip(
+            get_frame=make_rgb_frame,
+            duration=duration,
+            width=sample.shape[1],
+            height=sample.shape[0],
+            alpha=alpha_clip_obj,
+        )
+        # blend_clips reads these via getattr — this is what makes cropping work
+        clip.x, clip.y = x, y
+        clip.pivot_x, clip.pivot_y = pivot_x, pivot_y
+        return clip
 
+    # --- legacy path: full-canvas frame, e.g. if you use text_clip standalone
+    # without blend_clips and need a literal (size)-shaped RGB/alpha frame ---
+    def make_rgba_frame_full(t: float) -> np.ndarray:
+        box = make_rgba_box(t)
+        bh, bw = box.shape[:2]
+        canvas = np.zeros((size[1], size[0], 4), dtype=np.uint8)
+        if bg_color != (0, 0, 0):
+            canvas[:, :, :3] = bg_color
+        cx = int(round(size[0] * pivot_x + x - bw * pivot_x))
+        cy = int(round(size[1] * pivot_y + y - bh * pivot_y))
+        x1, y1 = max(0, cx), max(0, cy)
+        x2, y2 = min(size[0], cx + bw), min(size[1], cy + bh)
+        bx1, by1 = max(0, -cx), max(0, -cy)
+        bx2, by2 = bx1 + (x2 - x1), by1 + (y2 - y1)
+        if x1 < x2 and y1 < y2:
+            canvas[y1:y2, x1:x2] = box[by1:by2, bx1:bx2]
+        return canvas
 
+    def make_rgb_frame_full(t): return make_rgba_frame_full(t)[:, :, :3]
+    def make_alpha_frame_full(t): return make_rgba_frame_full(t)[:, :, 3]
 
-
-
-
-
-
-
-
+    alpha_clip_obj = Clip(get_frame=make_alpha_frame_full, duration=duration)
+    return PixelClip(
+        get_frame=make_rgb_frame_full,
+        duration=duration,
+        width=size[0],
+        height=size[1],
+        alpha=alpha_clip_obj,
+    )
 
 from concurrent.futures import ThreadPoolExecutor
-import math
-import queue
-from typing import Optional, Tuple
-import av
-import numpy as np
 from tqdm import tqdm
 
 
