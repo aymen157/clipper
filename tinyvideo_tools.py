@@ -147,6 +147,7 @@ def trim(
 
 from typing import Literal
 
+# this is used to create looping videos
 def extend(
     clip: Clip,
     additional_duration: float,

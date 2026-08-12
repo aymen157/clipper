@@ -1,6 +1,7 @@
 
 from tinyvideo import *
 from tinyvideo_tools import *
+import tinyvideo_tools_audio as sfx
 
 def example_trimming():
     video = video_file_clip(r"tests/mhw.mp4")
@@ -73,7 +74,7 @@ def example_blend():
 
 
 def example_blend_delayed_extended():
-    video_1 = video_file_clip(r"tests/pexels_bird.mp4")
+    video_1 = video_file_clip(r"tests/pexels_running.mp4")
 
     video_2 = text_clip(
         text="Thank you for watching !",
@@ -85,7 +86,7 @@ def example_blend_delayed_extended():
     video_2.delay = video_1.duration - video_2.duration
     video_2 = fade_in(video_2, duration=.2)
 
-    video = blend_clips([video_1, video_2])
+    video = blend_clips([video_1, video_2], size=(1080, 1918))
     # we fade rgb bc the clip has an alpha but the export doesn't export alphas as black.
     video = fade_in(video, duration=1.5, fade_rgb=True)
     video = fade_out(video, duration=.5, fade_rgb=True)
@@ -97,5 +98,16 @@ def example_blend_delayed_extended():
         fps=30,
     )
 
+def example_audio_video_mix():
+    video = video_file_clip(r"tests/pexels_bird.mp4")
+    audio = audio_file_clip(r"tests/freesound_community-girlprettyvoicehumming-35489.mp3")
+    audio = sfx.trim_end(audio, amount=(audio.duration - video.duration) )
+    write_videofile(
+        clip=video,
+        audio_clip=audio,
+        output_path="tests/output.mp4",
+        fps=30,
+    )
 
-example_blend_delayed_extended()
+
+example_audio_video_mix()

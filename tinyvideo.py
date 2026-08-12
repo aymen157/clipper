@@ -124,6 +124,32 @@ class AudioClip:
             raise ValueError(f"Time {t_start}s out of bounds for clip duration {self.duration}s")
         return self._get_samples_fn(t_start, duration)
 
+    def derive(
+        self,
+        get_samples: Optional[Callable[[float, float], np.ndarray]] = None,
+        duration: Optional[float] = None,
+        **overrides,
+    ) -> "AudioClip":
+        """
+        Creates a new AudioClip that inherits everything about this one --
+        sample_rate, channels, and any extra attribute anyone has bolted on
+        (volume, pan, start_time, custom metadata, whatever) --
+        except for what's explicitly overridden here.
+        """
+        new_clip = self.__class__.__new__(self.__class__)
+        new_clip.__dict__.update(self.__dict__)
+
+        if get_samples is not None:
+            # Matches how your class stores sample fetching callbacks
+            new_clip.get_samples = get_samples  
+        if duration is not None:
+            new_clip.duration = float(duration)
+
+        for key, value in overrides.items():
+            setattr(new_clip, key, value)
+
+        return new_clip
+
     def close(self):
         """Release underlying resources if the provider supports it."""
         if hasattr(self._get_samples_fn, "close"):
@@ -255,76 +281,61 @@ def video_file_clip(file_path: str) -> Clip:
     clip.file_path = file_path
     return clip
 
+import av
+import numpy as np
+
 def audio_file_clip(file_path: str, sample_rate: int = 44100, channels: int = 2) -> AudioClip:
-    """Audio clip backed by PyAV with persistent connection and persistent resampler."""
+    """Decodes full audio into a NumPy array up front (Zero seek-glitches, ultra fast)."""
     container = av.open(file_path)
-
-    if not container.streams.audio:
-        container.close()
-        raise ValueError(f"No audio stream found in {file_path}")
-
     stream = container.streams.audio[0]
-
-    if stream.duration and stream.time_base:
-        duration = float(stream.duration * stream.time_base)
-    else:
-        duration = float(container.duration / av.time_base)
-
-    class AudioSampleReader:
-        def __init__(self):
-            self.resampler = av.AudioResampler(
-                format='fltp',
-                layout='stereo' if channels == 2 else 'mono',
-                rate=sample_rate,
-            )
-
-        def __call__(self, t_start: float, fetch_duration: float) -> np.ndarray:
-            num_requested_samples = int(fetch_duration * sample_rate)
-            target_pts = int(t_start / stream.time_base)
-
-            # Seek to target position
-            container.seek(target_pts, stream=stream, backward=True)
-
-            collected_samples = []
-            total_collected = 0
-
-            for packet in container.demux(stream):
-                for frame in packet.decode():
-                    resampled_frames = self.resampler.resample(frame)
-                    if not resampled_frames:
-                        continue
-
-                    for r_frame in resampled_frames:
-                        data = r_frame.to_ndarray()
-                        collected_samples.append(data)
-                        total_collected += data.shape[1]
-
-                        if total_collected >= num_requested_samples:
-                            break
-                    if total_collected >= num_requested_samples:
-                        break
-                if total_collected >= num_requested_samples:
-                    break
-
-            if not collected_samples:
-                return np.zeros((channels, num_requested_samples), dtype=np.float32)
-
-            full_audio = np.concatenate(collected_samples, axis=1)
-            return full_audio[:, :num_requested_samples]
-
-        def close(self):
-            container.close()
-
-    sample_reader = AudioSampleReader()
-    audio_clip = AudioClip(
-        get_samples=sample_reader,
-        duration=duration,
-        sample_rate=sample_rate,
-        channels=channels,
+    
+    resampler = av.AudioResampler(
+        format='fltp',
+        layout='stereo' if channels == 2 else 'mono',
+        rate=sample_rate,
     )
-    audio_clip.file_path = file_path
-    return audio_clip
+    
+    chunks = []
+    for packet in container.demux(stream):
+        for frame in packet.decode():
+            for r_frame in resampler.resample(frame):
+                chunks.append(r_frame.to_ndarray())
+                
+    for r_frame in resampler.resample(None): # flush
+        chunks.append(r_frame.to_ndarray())
+        
+    container.close()
+    
+    # Full audio array in memory: shape (channels, total_samples)
+    data = np.concatenate(chunks, axis=1) if chunks else np.zeros((channels, 0), dtype=np.float32)
+    duration = data.shape[1] / sample_rate
 
+    def get_samples(t_start: float, fetch_duration: float) -> np.ndarray:
+        start_idx = int(t_start * sample_rate)
+        num_samples = int(fetch_duration * sample_rate)
+        end_idx = start_idx + num_samples
+        
+        # Out-of-bounds safety check
+        if start_idx >= data.shape[1] or end_idx < 0:
+            return np.zeros((channels, num_samples), dtype=np.float32)
+            
+        # Pad if bounds extend past array edges
+        pad_left = max(0, -start_idx)
+        pad_right = max(0, end_idx - data.shape[1])
+        
+        valid_start = max(0, start_idx)
+        valid_end = min(data.shape[1], end_idx)
+        
+        slice_data = data[:, valid_start:valid_end]
+        
+        if pad_left > 0 or pad_right > 0:
+            slice_data = np.pad(slice_data, ((0, 0), (pad_left, pad_right)), mode='constant')
+            
+        return slice_data
+
+    clip = AudioClip(get_samples=get_samples, duration=duration, sample_rate=sample_rate, channels=channels)
+    clip.file_path = file_path
+    return clip
 
 T = TypeVar('T')
 ValueOrCallable = Union[T, Callable[[float], T]]
@@ -543,6 +554,14 @@ def detect_best_h264_encoder() -> Tuple[str, dict]:
     return "h264", {"preset": "ultrafast", "crf": "23", "threads": "auto"}
 
 
+import math
+import queue
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+import av
+from tqdm import tqdm
+
+
 def write_videofile(
     clip: "Clip",
     output_path: str,
@@ -580,7 +599,23 @@ def write_videofile(
     fifo = None
     if audio_clip is not None:
         a_stream = container.add_stream("aac", rate=audio_clip.sample_rate)
-        a_stream.channels = audio_clip.channels
+        
+        # Dynamic layout mapping (PyAV v10+ compatible)
+        layout_map = {
+            1: "mono",
+            2: "stereo",
+            3: "2.1",
+            4: "4.0",
+            6: "5.1",
+            8: "7.1"
+        }
+        
+        # Use from_channels() for safe fallback if channel count isn't in common map
+        if audio_clip.channels in layout_map:
+            a_stream.layout = layout_map[audio_clip.channels]
+        else:
+            a_stream.layout = av.AudioLayout.from_channels(audio_clip.channels)
+
         a_stream.format = "fltp"
         a_stream.options = {"threads": "auto"}
         fifo = av.AudioFifo()
@@ -588,10 +623,7 @@ def write_videofile(
     dt = 1.0 / fps
     total_frames = int(clip.duration * fps)
 
-    # Detect the frame's channel layout once by sampling it. Pixel content is
-    # RGBA by convention, but nothing enforces that, so check the real data.
-    # swscale converts either straight to yuv420p in one pass -- an alpha
-    # channel present here is simply dropped during conversion.
+    # Detect the frame's channel layout once by sampling it.
     sample_frame = clip.get_frame(0.0)
     channels = sample_frame.shape[2] if sample_frame.ndim == 3 else 1
     src_format = "rgba" if channels == 4 else "rgb24"
@@ -636,7 +668,8 @@ def write_videofile(
     # --- ENCODE AUDIO IN STREAMED CHUNKS ---
     if audio_clip is not None and a_stream is not None and fifo is not None:
         chunk_duration = 1.0
-        layout = "stereo" if audio_clip.channels == 2 else "mono"
+        # Sync chunk layout with audio stream layout
+        layout = a_stream.layout.name
         num_chunks = math.ceil(audio_clip.duration / chunk_duration)
         frame_pts = 0
 
