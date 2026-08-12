@@ -1,7 +1,7 @@
 
-from tinyvideo import *
-from tinyvideo_tools import *
-import tinyvideo_tools_audio as sfx
+from clipper import *
+from clipper_tools import *
+import clipper_tools_audio as sfx
 
 def example_trimming():
     video = video_file_clip(r"tests/mhw.mp4")

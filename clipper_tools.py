@@ -1,4 +1,4 @@
-from tinyvideo import *
+from clipper import *
 
 
 def _is_rgba(frame: np.ndarray) -> bool:

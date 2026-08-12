@@ -1,4 +1,19 @@
+# Clipper
 
+Clipper (formely tinyvideo), is a library for composing and editing videos.
+similar to adobe premiere or after effects, but it's purpose is automatisation through scripting.
+it doesn't replace these DCC software, it has a different purpose that boosts productivity and flexibility
+
+# structure
+
+`clipper.py` is the lightweight core module, and it contains main structures: image/text/video/audio/export functions.
+`clipper_tools.py` contains filters to be applied on a clip with pixels (ie image/text/videos)
+`clipper_tools_audio.py` contains filters to be applied on an audio clip.
+
+both `tools` files depend on the core, but they are completely decoupled. and every function inside them, is decoupled from the other functions (ie. you can delete any function at any time and the script won't break)
+
+
+# technical details
 
 video is streamed from disk, frame by frame. the filters applied over frame at time t.
 

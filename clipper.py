@@ -68,7 +68,7 @@ class Clip:
         x, y, pivot_x, pivot_y, blend_mode, custom metadata, whatever) --
         except for what's explicitly overridden here.
 
-        This is what every filter/effect in tinyvideo_tools.py should use to
+        This is what every filter/effect in tools.py should use to
         build its output clip. It's the alternative to keeping an explicit
         list of "attributes that matter" (e.g. a fixed `delay`/`x`/`y`/...
         allowlist) somewhere central: that kind of list quietly couples every
