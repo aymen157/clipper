@@ -60,7 +60,7 @@ def example_blend():
         size=(700, 400)
     )
 
-    video = blend_clips([video_1, video_2])
+    video = blend_clips([video_1, video_2], size=(1920, 1080))
     # we fade rgb bc the clip has an alpha but the export doesn't export alphas as black.
     video = fade_in(video, duration=1.5, fade_rgb=True)
     video = fade_out(video, duration=1.5, fade_rgb=True)
@@ -72,8 +72,8 @@ def example_blend():
     )
 
 
-def example_blend_delayed():
-    video_1 = video_file_clip(r"tests/11650608-hd_1920_1080_30fps.mp4")
+def example_blend_delayed_extended():
+    video_1 = video_file_clip(r"tests/pexels_bird.mp4")
 
     video_2 = text_clip(
         text="Thank you for watching !",
@@ -89,6 +89,7 @@ def example_blend_delayed():
     # we fade rgb bc the clip has an alpha but the export doesn't export alphas as black.
     video = fade_in(video, duration=1.5, fade_rgb=True)
     video = fade_out(video, duration=.5, fade_rgb=True)
+    video = extend(video, additional_duration=video.duration, mode="yoyo") # add a loop playing backwards
 
     write_videofile(
         clip=video,
@@ -97,4 +98,4 @@ def example_blend_delayed():
     )
 
 
-example_blend_delayed()
+example_blend_delayed_extended()

@@ -205,16 +205,13 @@ def image_file_clip(image_path: str, duration: float) -> Clip:
     clip.image_path = image_path
     return clip
 
-
 def video_file_clip(file_path: str) -> Clip:
     """Memory-efficient, stateful VideoClip using persistent PyAV demuxer."""
     container = av.open(file_path)
     stream = container.streams.video[0]
     stream.thread_type = "AUTO"  # Enable multithreaded decoding
-
     width = stream.width
     height = stream.height
-
     if stream.duration and stream.time_base:
         duration = float(stream.duration * stream.time_base)
     else:
@@ -223,35 +220,31 @@ def video_file_clip(file_path: str) -> Clip:
     class VideoFrameReader:
         def __init__(self):
             self.decoder = container.decode(stream)
-            self.last_frame: Optional[av.VideoFrame] = None
+            self.last_frame_array: Optional[np.ndarray] = None
             self.last_pts: int = -1
 
         def __call__(self, t: float) -> np.ndarray:
             target_pts = int(t / stream.time_base)
-
             # If seeking backwards or jumping more than 1 second ahead, perform a seek
             if target_pts < self.last_pts or target_pts > self.last_pts + int(1.0 / stream.time_base):
                 container.seek(target_pts, stream=stream, backward=True)
                 self.decoder = container.decode(stream)
                 self.last_pts = -1
+                self.last_frame_array = None  # invalidate cache — old buffer may be reused/overwritten by libav after a seek
 
-            # Advance decoder sequentially until target timestamp is reached.
-            # Decoding straight to 'rgba' lets libswscale produce the alpha
-            # channel in the same conversion pass as the color data (it's
-            # opaque/255 for sources with no real alpha, and genuinely decoded
-            # for formats that do carry one, e.g. ProRes 4444 or VP9 w/ alpha).
-            if self.last_frame is not None and self.last_frame.pts >= target_pts:
-                return self.last_frame.to_ndarray(format='rgba')
+            # Only reuse the cached frame if it came from *this* decode run and still covers target_pts
+            if self.last_frame_array is not None and self.last_pts >= target_pts:
+                return self.last_frame_array
 
             for frame in self.decoder:
                 self.last_pts = frame.pts
                 if frame.pts >= target_pts:
-                    self.last_frame = frame
-                    return frame.to_ndarray(format='rgba')
+                    self.last_frame_array = frame.to_ndarray(format='rgba')
+                    return self.last_frame_array
 
             # Fallback if frame is past stream duration end
-            if self.last_frame is not None:
-                return self.last_frame.to_ndarray(format='rgba')
+            if self.last_frame_array is not None:
+                return self.last_frame_array
             raise RuntimeError(f"Could not decode frame at {t}s")
 
         def close(self):
@@ -261,7 +254,6 @@ def video_file_clip(file_path: str) -> Clip:
     clip = Clip(get_frame=frame_reader, duration=duration, width=width, height=height)
     clip.file_path = file_path
     return clip
-
 
 def audio_file_clip(file_path: str, sample_rate: int = 44100, channels: int = 2) -> AudioClip:
     """Audio clip backed by PyAV with persistent connection and persistent resampler."""
