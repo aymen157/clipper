@@ -1,119 +1,71 @@
-
 from tinyvideo import *
 
+
+def _is_rgba(frame: np.ndarray) -> bool:
+    return frame.ndim == 3 and frame.shape[2] == 4
+
+
 def invert_colors(clip: Clip) -> Clip:
+    is_rgba = _is_rgba(clip.get_frame(0.0))
+
     def make_frame(t: float):
         frame = clip.get_frame(t)
+        if is_rgba:
+            out = frame.copy()
+            out[..., :3] = 255 - out[..., :3]  # leave alpha untouched
+            return out
         return 255 - frame
 
-    new_clip = Clip(get_frame=make_frame, duration=clip.duration)
+    return clip.derive(get_frame=make_frame)
 
-    # Preserve width/height if they were attached to the source clip
-    if hasattr(clip, "width"):
-        new_clip.width = clip.width
-    if hasattr(clip, "height"):
-        new_clip.height = clip.height
-
-    return new_clip
 
 def fade_in(clip: Clip, duration: float, fade_rgb: bool = False) -> Clip:
-    """Applies a fade-in effect. 
-    If fade_rgb is True or no alpha exists, multiplies RGB to black.
+    """Applies a fade-in effect.
+
+    For RGBA clips, fades the alpha channel from 0 by default (a transparency
+    fade-in); pass fade_rgb=True to instead multiply the RGB channels up from
+    black. Clips with no alpha channel always fade via RGB multiply.
     """
-    has_alpha = isinstance(clip, PixelClip) and clip.alpha is not None and not fade_rgb
+    fade_alpha = _is_rgba(clip.get_frame(0.0)) and not fade_rgb
 
-    if has_alpha:
-        orig_alpha = clip.alpha
-        def make_alpha_frame(t: float) -> np.ndarray:
-            a_frame = orig_alpha.get_frame(t)
-            if t < duration:
-                factor = t / duration
-                return (a_frame * factor).astype(np.uint8)
-            return a_frame
-
-        new_alpha = Clip(get_frame=make_alpha_frame, duration=clip.duration)
-        return PixelClip(
-            get_frame=clip.get_frame,
-            duration=clip.duration,
-            width=clip.width,
-            height=clip.height,
-            alpha=new_alpha,
-        )
-    else:
-        # Fades RGB pixels directly to black
-        def make_frame(t: float) -> np.ndarray:
-            frame = clip.get_frame(t)
-            if t < duration:
-                factor = t / duration
-                return (frame * factor).astype(np.uint8)
+    def make_frame(t: float) -> np.ndarray:
+        frame = clip.get_frame(t)
+        if t >= duration:
             return frame
+        factor = t / duration
+        out = frame.copy()
+        if fade_alpha:
+            out[..., 3] = (out[..., 3] * factor).astype(np.uint8)
+        else:
+            out[..., :3] = (out[..., :3] * factor).astype(np.uint8)
+        return out
 
-        if isinstance(clip, PixelClip):
-            return PixelClip(
-                get_frame=make_frame,
-                duration=clip.duration,
-                width=clip.width,
-                height=clip.height,
-                alpha=clip.alpha,
-            )
+    return clip.derive(get_frame=make_frame)
 
-        new_clip = Clip(get_frame=make_frame, duration=clip.duration)
-        if hasattr(clip, "width"): new_clip.width = clip.width
-        if hasattr(clip, "height"): new_clip.height = clip.height
-        return new_clip
 
 def fade_out(clip: Clip, duration: float, fade_rgb: bool = False) -> Clip:
     """Applies a fade-out effect over `duration` seconds at the end of the clip.
-    
-    If fade_rgb is True or no alpha channel exists, fades the RGB pixels directly to black.
-    Otherwise, fades the alpha mask down to 0.
+
+    For RGBA clips, fades the alpha channel to 0 by default (a transparency
+    fade-out); pass fade_rgb=True to instead multiply the RGB channels down to
+    black. Clips with no alpha channel always fade via RGB multiply.
     """
     fade_start = clip.duration - duration
-    has_alpha = isinstance(clip, PixelClip) and clip.alpha is not None and not fade_rgb
+    fade_alpha = _is_rgba(clip.get_frame(0.0)) and not fade_rgb
 
-    if has_alpha:
-        orig_alpha = clip.alpha
-
-        def make_alpha_frame(t: float) -> np.ndarray:
-            a_frame = orig_alpha.get_frame(t)
-            if t > fade_start:
-                factor = max(0.0, (clip.duration - t) / duration)
-                return (a_frame * factor).astype(np.uint8)
-            return a_frame
-
-        new_alpha = Clip(get_frame=make_alpha_frame, duration=clip.duration)
-
-        return PixelClip(
-            get_frame=clip.get_frame,
-            duration=clip.duration,
-            width=clip.width,
-            height=clip.height,
-            alpha=new_alpha,
-        )
-    else:
-        # Multiply RGB pixels directly to black
-        def make_frame(t: float) -> np.ndarray:
-            frame = clip.get_frame(t)
-            if t > fade_start:
-                factor = max(0.0, (clip.duration - t) / duration)
-                return (frame * factor).astype(np.uint8)
+    def make_frame(t: float) -> np.ndarray:
+        frame = clip.get_frame(t)
+        if t <= fade_start:
             return frame
+        factor = max(0.0, (clip.duration - t) / duration)
+        out = frame.copy()
+        if fade_alpha:
+            out[..., 3] = (out[..., 3] * factor).astype(np.uint8)
+        else:
+            out[..., :3] = (out[..., :3] * factor).astype(np.uint8)
+        return out
 
-        if isinstance(clip, PixelClip):
-            return PixelClip(
-                get_frame=make_frame,
-                duration=clip.duration,
-                width=clip.width,
-                height=clip.height,
-                alpha=clip.alpha,
-            )
-
-        new_clip = Clip(get_frame=make_frame, duration=clip.duration)
-        if hasattr(clip, "width"):
-            new_clip.width = clip.width
-        if hasattr(clip, "height"):
-            new_clip.height = clip.height
-        return new_clip
+    return clip.derive(get_frame=make_frame)
 
 
 def trim_start(clip: Clip, amount: float, percent: bool = False) -> Clip:
@@ -138,14 +90,7 @@ def trim_start(clip: Clip, amount: float, percent: bool = False) -> Clip:
     def make_frame(t: float) -> np.ndarray:
         return clip.get_frame(t + seconds)
 
-    new_clip = Clip(get_frame=make_frame, duration=new_duration)
-
-    if hasattr(clip, "width"):
-        new_clip.width = clip.width
-    if hasattr(clip, "height"):
-        new_clip.height = clip.height
-
-    return new_clip
+    return clip.derive(get_frame=make_frame, duration=new_duration)
 
 
 def trim_end(clip: Clip, amount: float, percent: bool = False) -> Clip:
@@ -169,14 +114,7 @@ def trim_end(clip: Clip, amount: float, percent: bool = False) -> Clip:
     def make_frame(t: float) -> np.ndarray:
         return clip.get_frame(t)
 
-    new_clip = Clip(get_frame=make_frame, duration=new_duration)
-
-    if hasattr(clip, "width"):
-        new_clip.width = clip.width
-    if hasattr(clip, "height"):
-        new_clip.height = clip.height
-
-    return new_clip
+    return clip.derive(get_frame=make_frame, duration=new_duration)
 
 
 def trim(
@@ -207,7 +145,6 @@ def trim(
     return trimmed
 
 
-
 from typing import Literal
 
 def extend(
@@ -217,7 +154,7 @@ def extend(
 ) -> Clip:
     """
     Extends the duration of a Clip by adding `additional_duration` seconds.
-    
+
     Modes:
       - "clamp": Holds the final frame static for the extended duration.
       - "wrap" : Loops the clip from the beginning (0s -> duration -> 0s -> duration).
@@ -257,15 +194,7 @@ def extend(
         mapped_t = max(0.0, min(mapped_t, orig_duration))
         return clip.get_frame(mapped_t)
 
-    new_clip = Clip(get_frame=make_frame, duration=new_duration)
-
-    # Preserve metadata attributes if present
-    if hasattr(clip, "width"):
-        new_clip.width = clip.width
-    if hasattr(clip, "height"):
-        new_clip.height = clip.height
-
-    return new_clip
+    return clip.derive(get_frame=make_frame, duration=new_duration)
 
 
 def resize(
@@ -275,10 +204,10 @@ def resize(
     keep_aspect: bool = True,
     aspect: Optional[float] = None,
 ) -> Clip:
-    """Resizes a Clip or PixelClip to target dimensions.
+    """Resizes a Clip to target dimensions.
 
     Args:
-        clip: The Clip or PixelClip instance to resize.
+        clip: The Clip instance to resize.
         width: Target width in pixels.
         height: Target height in pixels.
         keep_aspect: If True, calculates missing dimensions or adjusts dimensions
@@ -287,7 +216,15 @@ def resize(
           derived from the source clip's dimensions (orig_w / orig_h).
 
     Returns:
-        A new PixelClip (or Clip) scaled to the resolved width and height.
+        A new Clip scaled to the resolved width and height.
+
+    Note: RGBA frames get a single LANCZOS resize over all 4 channels instead
+    of one LANCZOS pass for RGB plus a separate BILINEAR pass for alpha.
+    That's roughly half the resample work. The one trade-off: LANCZOS can
+    ring slightly at hard alpha edges (a faint dark or light fringe) where
+    BILINEAR wouldn't. If you hit that on a hard-edged cutout, downsample in
+    two passes yourself; for nearly everything else the single pass is a
+    clear win.
     """
     # 1. Resolve source dimensions
     orig_w = getattr(clip, "width", None)
@@ -331,54 +268,30 @@ def resize(
     target_w = max(1, target_w)
     target_h = max(1, target_h)
 
-    # 4. Frame transformation functions
-    def make_rgb_frame(t: float) -> np.ndarray:
+    # 4. Frame transformation
+    def make_frame(t: float) -> np.ndarray:
         frame = clip.get_frame(t)
         img = Image.fromarray(frame)
         resized_img = img.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
         return np.array(resized_img, dtype=np.uint8)
 
-    # 5. Handle PixelClip with alpha mask vs standard Clip
-    if isinstance(clip, PixelClip):
-        resized_alpha = None
-        if clip.alpha is not None:
-            orig_alpha = clip.alpha
-
-            def make_alpha_frame(t: float) -> np.ndarray:
-                a_frame = orig_alpha.get_frame(t)
-                img = Image.fromarray(a_frame)
-                resized_img = img.resize((target_w, target_h), resample=Image.Resampling.BILINEAR)
-                return np.array(resized_img, dtype=np.uint8)
-
-            resized_alpha = Clip(get_frame=make_alpha_frame, duration=clip.duration)
-
-        return PixelClip(
-            get_frame=make_rgb_frame,
-            duration=clip.duration,
-            width=target_w,
-            height=target_h,
-            alpha=resized_alpha,
-        )
-
-    # Fallback for base Clip instances
-    new_clip = Clip(get_frame=make_rgb_frame, duration=clip.duration)
-    new_clip.width = target_w
-    new_clip.height = target_h
-    return new_clip
+    return clip.derive(get_frame=make_frame, width=target_w, height=target_h)
 
 
 def concat(clips: list[Clip]) -> Clip:
-    """Concatenates a list of video clips sequentially in time.
+    """Concatenates a list of video clips sequentially in time. this is a less flexible version of blend() which layers and delays, but its much more performant
 
     Args:
-        clips: List of Clip or PixelClip objects to concatenate.
+        clips: List of Clip objects to concatenate.
 
     Returns:
-        A new PixelClip (or Clip) spanning the total combined duration.
+        A new Clip spanning the total combined duration, derived from clips[0]
+        (so it carries forward whatever extra attributes clips[0] had).
 
     Raises:
-        ValueError: If `clips` is empty, if clips have mismatched dimensions (width/height),
-                    or if mixing PixelClips with and without alpha masks.
+        ValueError: If `clips` is empty, or if clips have mismatched dimensions
+                    (width/height) or mismatched channel layout (e.g. RGBA mixed
+                    with RGB-only).
     """
     if not clips:
         raise ValueError("Cannot concatenate an empty list of clips.")
@@ -387,22 +300,21 @@ def concat(clips: list[Clip]) -> Clip:
     first_clip = clips[0]
     ref_w = getattr(first_clip, "width", None)
     ref_h = getattr(first_clip, "height", None)
+    ref_frame = first_clip.get_frame(0.0)
 
     if ref_w is None or ref_h is None:
-        sample_frame = first_clip.get_frame(0.0)
-        ref_h, ref_w = sample_frame.shape[:2]
+        ref_h, ref_w = ref_frame.shape[:2]
 
-    is_pixel_clip = isinstance(first_clip, PixelClip)
-    has_alpha = is_pixel_clip and (first_clip.alpha is not None)
+    ref_is_rgba = _is_rgba(ref_frame)
 
-    # 2. Validate dimensions and alpha consistency across all clips
+    # 2. Validate dimensions and channel-layout consistency across all clips
     for idx, c in enumerate(clips):
         c_w = getattr(c, "width", None)
         c_h = getattr(c, "height", None)
+        c_frame = c.get_frame(0.0)
 
         if c_w is None or c_h is None:
-            sample = c.get_frame(0.0)
-            c_h, c_w = sample.shape[:2]
+            c_h, c_w = c_frame.shape[:2]
 
         if c_w != ref_w or c_h != ref_h:
             raise ValueError(
@@ -410,11 +322,10 @@ def concat(clips: list[Clip]) -> Clip:
                 f"expected ({ref_w}x{ref_h}), got ({c_w}x{c_h})."
             )
 
-        c_has_alpha = isinstance(c, PixelClip) and (c.alpha is not None)
-        if c_has_alpha != has_alpha:
+        if _is_rgba(c_frame) != ref_is_rgba:
             raise ValueError(
-                f"Alpha channel mismatch at clip index {idx}: "
-                f"Clip 0 has alpha={has_alpha}, but clip {idx} has alpha={c_has_alpha}."
+                f"Channel layout mismatch at clip index {idx}: "
+                f"clip 0 is_rgba={ref_is_rgba}, but clip {idx} is_rgba={_is_rgba(c_frame)}."
             )
 
     # 3. Calculate total duration and cumulative timeline offsets
@@ -434,140 +345,122 @@ def concat(clips: list[Clip]) -> Clip:
         local_t = t_clamped - offsets[idx]
         return idx, local_t
 
-    # 5. Define RGB frame sampler
+    # 5. Define frame sampler (single call per frame -- RGBA and all)
     def make_frame(t: float) -> np.ndarray:
         idx, local_t = find_clip_index(t)
         return clips[idx].get_frame(local_t)
 
-    # 6. Handle alpha mask concatenation if present
-    out_alpha = None
-    if has_alpha:
-        def make_alpha_frame(t: float) -> np.ndarray:
-            idx, local_t = find_clip_index(t)
-            return clips[idx].alpha.get_frame(local_t)
-
-        out_alpha = Clip(get_frame=make_alpha_frame, duration=total_duration)
-
-    # 7. Construct output clip
-    if is_pixel_clip:
-        return PixelClip(
-            get_frame=make_frame,
-            duration=total_duration,
-            width=ref_w,
-            height=ref_h,
-            alpha=out_alpha,
-        )
-
-    out_clip = Clip(get_frame=make_frame, duration=total_duration)
-    out_clip.width = ref_w
-    out_clip.height = ref_h
-    return out_clip
+    return first_clip.derive(get_frame=make_frame, duration=total_duration, width=ref_w, height=ref_h)
 
 
 def blend_clips(
     videos: list[Clip],
-    blend_mode: Union[str, list[str]] = "normal",
+    default_blend_mode: str = "normal",
     size: tuple[int, int] = (1920, 1080),
     pivot: tuple[float, float] = (0.5, 0.5),
-    default_el_pivot: tuple[float, float] = (0.5, 0.5),
-) -> PixelClip:
+    default_pivot: tuple[float, float] = (0.5, 0.5),
+    default_delay: float = 0.0,
+) -> Clip:
     """Composites multiple video layers onto a canvas with custom positioning, alignment pivots, and blend modes.
 
     Args:
-        videos: List of Clip or PixelClip objects ordered from bottom layer to top layer.
-        blend_mode: Blend mode string ('normal', 'multiply', 'screen', 'overlay', 'add') 
-                    or a list of blend mode strings per video layer.
-        width: Canvas width.
-        height: Canvas height.
-        pivot_x: Canvas alignment anchor X (0.0 = left, 0.5 = center, 1.0 = right).
-        pivot_y: Canvas alignment anchor Y (0.0 = top, 0.5 = center, 1.0 = bottom).
+        videos: List of Clip objects ordered from bottom layer to top layer.
+        default_blend_mode: Default blend mode string ('normal', 'multiply', 'screen', 'overlay', 'add').
+        size: Canvas (width, height) tuple.
+        pivot: Canvas alignment anchor tuple (pivot_x, pivot_y).
+        default_pivot: Default element alignment anchor tuple (pivot_x, pivot_y).
+        default_delay: Default start delay in seconds for clips without a delay attribute.
 
     Returns:
-        A composited PixelClip with an updated alpha channel representing the combined output.
+        A composited Clip producing RGBA frames.
+    `t`.
     """
     if not videos:
         raise ValueError("`videos` list cannot be empty.")
 
     width, height = size
     pivot_x, pivot_y = pivot
-    default_el_pivot_x, default_el_pivot_y = default_el_pivot
+    default_pivot_x, default_pivot_y = default_pivot
 
-    # 1. Resolve blend modes per layer
-    if isinstance(blend_mode, list):
-        if len(blend_mode) != len(videos):
-            raise ValueError("Length of `blend_mode` list must match number of `videos`.")
-        blend_modes = [b.lower() for b in blend_mode]
-    else:
-        blend_modes = [blend_mode.lower()] * len(videos)
+    # Canvas anchor is invariant across frames/clips -- hoist it out of the hot path.
+    canvas_anchor_x = width * pivot_x
+    canvas_anchor_y = height * pivot_y
 
-    # 2. Maximum duration across all input layers
-    total_duration = max(v.duration for v in videos)
+    # Maximum duration across all input layers including delay
+    total_duration = max(v.duration + getattr(v, "delay", default_delay) for v in videos)
 
-    # Helper function for pixel blending modes
+    # --- Blend helpers -----------------------------------------------------
+    # "normal" never needs a float cast, so it's kept out of the float32 path.
     def apply_blend(dst_rgb: np.ndarray, src_rgb: np.ndarray, mode: str) -> np.ndarray:
+        if mode == "normal":
+            return src_rgb
+
         d = dst_rgb.astype(np.float32)
         s = src_rgb.astype(np.float32)
 
-        if mode == "normal":
-            return src_rgb
-        elif mode == "multiply":
-            return ((d * s) / 255.0).astype(np.uint8)
+        if mode == "multiply":
+            return ((d * s) * (1.0 / 255.0)).astype(np.uint8)
         elif mode == "screen":
-            return (255.0 - ((255.0 - d) * (255.0 - s)) / 255.0).astype(np.uint8)
+            return (255.0 - ((255.0 - d) * (255.0 - s)) * (1.0 / 255.0)).astype(np.uint8)
         elif mode == "add":
-            return np.clip(d + s, 0, 255).astype(np.uint8)
+            np.add(d, s, out=d)
+            np.clip(d, 0, 255, out=d)
+            return d.astype(np.uint8)
         elif mode == "overlay":
             mask = d < 128.0
             res = np.empty_like(d)
-            res[mask] = (2.0 * d[mask] * s[mask]) / 255.0
-            res[~mask] = 255.0 - (2.0 * (255.0 - d[~mask]) * (255.0 - s[~mask])) / 255.0
-            return np.clip(res, 0, 255).astype(np.uint8)
+            res[mask] = (2.0 * d[mask] * s[mask]) * (1.0 / 255.0)
+            inv_mask = ~mask
+            res[inv_mask] = 255.0 - (2.0 * (255.0 - d[inv_mask]) * (255.0 - s[inv_mask])) * (1.0 / 255.0)
+            np.clip(res, 0, 255, out=res)
+            return res.astype(np.uint8)
         else:
             return src_rgb  # Default fallback to normal blend
 
-    # 3. Main frame synthesis loop
-    def make_rgba_frame(t: float) -> np.ndarray:
-        # Create output canvas in RGBA (initialized to transparent)
+    # --- Main frame synthesis -----------------------------------------------
+    def render_rgba(t: float) -> np.ndarray:
         canvas_rgba = np.zeros((height, width, 4), dtype=np.uint8)
 
-        for clip, mode in zip(videos, blend_modes):
-            # Skip clip if t exceeds its duration
-            if t > clip.duration:
+        for clip in videos:
+            delay = getattr(clip, "delay", default_delay)
+
+            # Skip clip if current time is before the start delay or past active duration
+            if t < delay or (t - delay) > clip.duration:
                 continue
 
-            rgb_frame = clip.get_frame(t)
+            clip_t = t - delay
+            frame = clip.get_frame(clip_t)  # single call now -- rgb+alpha in one array
+
+            # Slices below are views, not copies -- splitting RGBA in-hand is
+            # essentially free compared to what used to be a second get_frame()
+            # dispatch into a wholly separate Clip (re-decoding video, re-hitting
+            # a resize/font cache, etc, depending on the source).
+            if _is_rgba(frame):
+                rgb_frame = frame[:, :, :3]
+                alpha_frame = frame[:, :, 3]
+            else:
+                rgb_frame = frame
+                alpha_frame = None
+
             c_h, c_w = rgb_frame.shape[:2]
 
-            # Resolve clip's alpha channel (default to 255 opaque if non-existent)
-            if isinstance(clip, PixelClip) and clip.alpha is not None:
-                alpha_frame = clip.alpha.get_frame(t)
-            else:
-                alpha_frame = np.full((c_h, c_w), 255, dtype=np.uint8)
+            mode = getattr(clip, "blend_mode", default_blend_mode).lower()
 
-            # --- CALCULATE POSITIONING & ANCHORS ---
-            # 1. Clip's own internal alignment anchor
-            c_pivot_x = getattr(clip, "pivot_x", default_el_pivot_x)
-            c_pivot_y = getattr(clip, "pivot_y", default_el_pivot_y)
-
-            # 2. Clip's targeted canvas position
+            # --- positioning & anchors ---
+            c_pivot_x = getattr(clip, "pivot_x", default_pivot_x)
+            c_pivot_y = getattr(clip, "pivot_y", default_pivot_y)
             clip_x = getattr(clip, "x", 0.0)
             clip_y = getattr(clip, "y", 0.0)
 
-            # 3. Global function anchor offset on canvas
-            canvas_anchor_x = width * pivot_x
-            canvas_anchor_y = height * pivot_y
-
-            # 4. Final top-left destination coordinates on the canvas
             dest_x = int(round(canvas_anchor_x + clip_x - (c_w * c_pivot_x)))
             dest_y = int(round(canvas_anchor_y + clip_y - (c_h * c_pivot_y)))
 
-            # --- BOUNDING BOX CLIPPING ---
+            # --- bounding box clipping ---
             src_x1 = max(0, -dest_x)
             src_y1 = max(0, -dest_y)
             src_x2 = min(c_w, width - dest_x)
             src_y2 = min(c_h, height - dest_y)
 
-            # Skip layer rendering if completely out of canvas bounds
             if src_x1 >= src_x2 or src_y1 >= src_y2:
                 continue
 
@@ -576,45 +469,48 @@ def blend_clips(
             dst_x2 = dest_x + src_x2
             dst_y2 = dest_y + src_y2
 
-            # Crop source clip regions
             cropped_rgb = rgb_frame[src_y1:src_y2, src_x1:src_x2]
-            cropped_alpha = alpha_frame[src_y1:src_y2, src_x1:src_x2]
-
-            # Crop current canvas regions
             canvas_region_rgb = canvas_rgba[dst_y1:dst_y2, dst_x1:dst_x2, :3]
             canvas_region_alpha = canvas_rgba[dst_y1:dst_y2, dst_x1:dst_x2, 3]
 
-            # Normalize alpha mask to [0.0, 1.0]
-            alpha_factor = (cropped_alpha.astype(np.float32) / 255.0)[:, :, None]
+            # Fast path: fully opaque + normal blend -> straight copy, no float
+            # math, no alpha crop/allocation, no lerp.
+            if alpha_frame is None and mode == "normal":
+                canvas_region_rgb[...] = cropped_rgb
+                canvas_region_alpha[...] = 255
+                continue
 
-            # Perform color blend calculation
+            cropped_alpha = (
+                alpha_frame[src_y1:src_y2, src_x1:src_x2]
+                if alpha_frame is not None
+                else np.full((src_y2 - src_y1, src_x2 - src_x1), 255, dtype=np.uint8)
+            )
+
+            # If this crop happens to be fully opaque anyway (common even when
+            # an alpha channel exists, e.g. mostly-opaque overlays), skip the lerp.
+            fully_opaque = alpha_frame is not None and bool(np.all(cropped_alpha == 255))
+
             blended_rgb = apply_blend(canvas_region_rgb, cropped_rgb, mode)
 
-            # Alpha Porter-Duff compositing
-            canvas_rgba[dst_y1:dst_y2, dst_x1:dst_x2, :3] = (
-                blended_rgb * alpha_factor + canvas_region_rgb * (1.0 - alpha_factor)
-            ).astype(np.uint8)
+            if fully_opaque:
+                canvas_region_rgb[...] = blended_rgb
+            else:
+                alpha_factor = cropped_alpha.astype(np.float32) * (1.0 / 255.0)
+                alpha_factor = alpha_factor[:, :, None]
+                blended_f = blended_rgb.astype(np.float32)
+                blended_f *= alpha_factor
+                canvas_f = canvas_region_rgb.astype(np.float32)
+                canvas_f *= (1.0 - alpha_factor)
+                blended_f += canvas_f
+                canvas_region_rgb[...] = blended_f.astype(np.uint8)
 
-            # Combine alpha channels
-            canvas_rgba[dst_y1:dst_y2, dst_x1:dst_x2, 3] = np.maximum(
-                canvas_region_alpha, cropped_alpha
-            )
+            np.maximum(canvas_region_alpha, cropped_alpha, out=canvas_region_alpha)
 
         return canvas_rgba
 
-    # 4. Split RGB and Alpha into dedicated PixelClip return structure
-    def make_rgb_frame(t: float) -> np.ndarray:
-        return make_rgba_frame(t)[:, :, :3]
-
-    def make_alpha_frame(t: float) -> np.ndarray:
-        return make_rgba_frame(t)[:, :, 3]
-
-    out_alpha = Clip(get_frame=make_alpha_frame, duration=total_duration)
-
-    return PixelClip(
-        get_frame=make_rgb_frame,
+    return Clip(
+        get_frame=render_rgba,
         duration=total_duration,
         width=width,
         height=height,
-        alpha=out_alpha,
     )

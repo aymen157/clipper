@@ -10,20 +10,83 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import av
 
 class Clip:
-    """Class representing a time-bound stream of RGB frames."""
+    """Class representing a time-bound stream of frames.
 
-    def __init__(self, get_frame: Callable[[float], np.ndarray], duration: float):
+    get_frame(t) returns a uint8 NumPy array. Visual/pixel content is RGBA
+    with shape (height, width, 4) -- fully-opaque content just has alpha ==
+    255 everywhere. Non-pixel content (e.g. a single-channel mask from
+    `mask_clip`) can be whatever shape its producer wants; nothing here
+    enforces RGBA, it's just the convention every pixel-producing function
+    in this module follows.
+
+    width/height are optional metadata -- set them when the spatial size is
+    known (compositing, resizing, and export all rely on them being there
+    for anything meant to be treated as an image), omit them otherwise.
+
+    There used to be a separate PixelClip subclass (carrying width/height)
+    and, before that, a separate `alpha` sub-Clip on it (mirroring MoviePy's
+    mask-clip design). Both were removed: the alpha split meant every
+    transform and every compositing pass had to fetch and manage two
+    independent frame streams that happened to share timing; the subclass
+    split meant every transform had to branch on `isinstance(clip,
+    PixelClip)` just to decide whether to preserve pixel-ness. Neither
+    distinction earned its keep once frames carry their own alpha channel --
+    "is this a pixel clip" is now just "does the frame's last dim happen to
+    be 4", checked directly against real data instead of type-checked.
+    """
+
+    def __init__(
+        self,
+        get_frame: Callable[[float], np.ndarray],
+        duration: float,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ):
         self.duration = float(duration)
         self._get_frame_fn = get_frame
+        if width is not None:
+            self.width = int(width)
+        if height is not None:
+            self.height = int(height)
 
     def get_frame(self, t: float) -> np.ndarray:
         """
         Extracts a frame at timestamp t (in seconds).
-        Returns a uint8 NumPy array with shape (height, width, 3) in RGB format.
         """
         if not (0 <= t <= self.duration):
             raise ValueError(f"Time {t}s is out of bounds for duration {self.duration}s")
         return self._get_frame_fn(t)
+
+    def derive(
+        self,
+        get_frame: Optional[Callable[[float], np.ndarray]] = None,
+        duration: Optional[float] = None,
+        **overrides,
+    ) -> "Clip":
+        """Creates a new Clip that inherits everything about this one --
+        width, height, and any extra attribute anyone has bolted on (delay,
+        x, y, pivot_x, pivot_y, blend_mode, custom metadata, whatever) --
+        except for what's explicitly overridden here.
+
+        This is what every filter/effect in tinyvideo_tools.py should use to
+        build its output clip. It's the alternative to keeping an explicit
+        list of "attributes that matter" (e.g. a fixed `delay`/`x`/`y`/...
+        allowlist) somewhere central: that kind of list quietly couples every
+        filter to every attribute any *other* piece of code (blend_clips,
+        write_videofile, your own script) decides to read via getattr(). Add
+        a new positioning/compositing attribute later and every filter
+        written against `derive` keeps forwarding it automatically, no
+        allowlist to remember to update.
+        """
+        new_clip = self.__class__.__new__(self.__class__)
+        new_clip.__dict__.update(self.__dict__)
+        if get_frame is not None:
+            new_clip._get_frame_fn = get_frame
+        if duration is not None:
+            new_clip.duration = float(duration)
+        for key, value in overrides.items():
+            setattr(new_clip, key, value)
+        return new_clip
 
     def close(self):
         """Release underlying resources if the provider supports it."""
@@ -35,28 +98,6 @@ class Clip:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-
-class PixelClip(Clip):
-    """Class representing a visual clip with spatial dimensions and an optional alpha mask clip."""
-
-    def __init__(
-        self,
-        get_frame: Callable[[float], np.ndarray],
-        duration: float,
-        width: int,
-        height: int,
-        alpha: Optional[Clip] = None,
-    ):
-        super().__init__(get_frame=get_frame, duration=duration)
-        self.width = int(width)
-        self.height = int(height)
-        self.alpha = alpha
-
-    def close(self):
-        super().close()
-        if self.alpha is not None:
-            self.alpha.close()
 
 
 class AudioClip:
@@ -95,23 +136,27 @@ class AudioClip:
         self.close()
 
 
-def single_color_clip(color: Tuple[int, int, int], width: int, height: int, duration: float) -> PixelClip:
+def single_color_clip(color: Tuple[int, int, int], width: int, height: int, duration: float) -> Clip:
     """
-    Create a Clip that displays a solid color for the given duration.
-    
+    Create a Clip that displays a solid, fully-opaque color for the given duration.
+
     Args:
-        color: (R, G, B) tuple with values 0–255
+        color: (R, G, B) tuple with values 0-255
         width: frame width
         height: frame height
         duration: clip duration in seconds
-    
-    Returns:
-        Clip object producing solid color frames
-    """
-    # Precompute the constant frame once
-    frame = np.full((height, width, 3), color, dtype=np.uint8)
 
-    return PixelClip(
+    Returns:
+        Clip producing constant RGBA frames (alpha = 255 everywhere)
+    """
+    r, g, b = color
+    frame = np.empty((height, width, 4), dtype=np.uint8)
+    frame[:, :, 0] = r
+    frame[:, :, 1] = g
+    frame[:, :, 2] = b
+    frame[:, :, 3] = 255
+
+    return Clip(
         get_frame=lambda t: frame,
         duration=duration,
         width=width,
@@ -123,8 +168,12 @@ def mask_clip(value: int, width: int, height: int, duration: float) -> Clip:
     """
     Create a Clip that displays a constant single-channel mask.
 
+    This is a standalone utility for producing raw (H, W) grayscale data --
+    e.g. as an input to something that builds a custom RGBA frame. It isn't
+    RGBA itself, and doesn't need to be; nothing here enforces a frame shape.
+
     Args:
-        value: grayscale value (0–255)
+        value: grayscale value (0-255)
         width: frame width
         height: frame height
         duration: clip duration in seconds
@@ -140,31 +189,24 @@ def mask_clip(value: int, width: int, height: int, duration: float) -> Clip:
     )
 
 
-def image_file_clip(image_path: str, duration: float) -> PixelClip:
+def image_file_clip(image_path: str, duration: float) -> Clip:
     """Creates a clip backed by a static image file repeated over a set duration."""
     with Image.open(image_path) as img:
-        img_rgba = img.convert('RGBA')
-        frame_rgba = np.array(img_rgba)
+        frame_rgba = np.array(img.convert('RGBA'), dtype=np.uint8)
 
-    rgb_frame = frame_rgba[:, :, :3]
-    alpha_frame = frame_rgba[:, :, 3]
+    height, width = frame_rgba.shape[:2]
 
-    height, width, _ = rgb_frame.shape
-
-    alpha_c = Clip(get_frame=lambda t: alpha_frame, duration=duration)
-
-    clip = PixelClip(
-        get_frame=lambda t: rgb_frame,
+    clip = Clip(
+        get_frame=lambda t: frame_rgba,
         duration=duration,
         width=width,
         height=height,
-        alpha=alpha_c
     )
     clip.image_path = image_path
     return clip
 
 
-def video_file_clip(file_path: str) -> PixelClip:
+def video_file_clip(file_path: str) -> Clip:
     """Memory-efficient, stateful VideoClip using persistent PyAV demuxer."""
     container = av.open(file_path)
     stream = container.streams.video[0]
@@ -193,26 +235,30 @@ def video_file_clip(file_path: str) -> PixelClip:
                 self.decoder = container.decode(stream)
                 self.last_pts = -1
 
-            # Advance decoder sequentially until target timestamp is reached
+            # Advance decoder sequentially until target timestamp is reached.
+            # Decoding straight to 'rgba' lets libswscale produce the alpha
+            # channel in the same conversion pass as the color data (it's
+            # opaque/255 for sources with no real alpha, and genuinely decoded
+            # for formats that do carry one, e.g. ProRes 4444 or VP9 w/ alpha).
             if self.last_frame is not None and self.last_frame.pts >= target_pts:
-                return self.last_frame.to_ndarray(format='rgb24')
+                return self.last_frame.to_ndarray(format='rgba')
 
             for frame in self.decoder:
                 self.last_pts = frame.pts
                 if frame.pts >= target_pts:
                     self.last_frame = frame
-                    return frame.to_ndarray(format='rgb24')
+                    return frame.to_ndarray(format='rgba')
 
             # Fallback if frame is past stream duration end
             if self.last_frame is not None:
-                return self.last_frame.to_ndarray(format='rgb24')
+                return self.last_frame.to_ndarray(format='rgba')
             raise RuntimeError(f"Could not decode frame at {t}s")
 
         def close(self):
             container.close()
 
     frame_reader = VideoFrameReader()
-    clip = PixelClip(get_frame=frame_reader, duration=duration, width=width, height=height)
+    clip = Clip(get_frame=frame_reader, duration=duration, width=width, height=height)
     clip.file_path = file_path
     return clip
 
@@ -329,14 +375,14 @@ def text_clip(
     y: float = 0.0,
     pivot_x: float = 0.5,
     pivot_y: float = 0.5,
-    crop_to_content: bool = True,   # NEW: skip full-canvas rendering
-) -> PixelClip:
+    crop_to_content: bool = True,   # skip full-canvas rendering
+) -> Clip:
 
     sample_text_0 = str(resolve_val(text, 0.0))
     sample_text_1 = str(resolve_val(text, 0.5))
     is_text_dynamic = callable(text) and (sample_text_0 != sample_text_1)
 
-    # NEW: the *whole rendered frame* is static (not just the text) only if
+    # The *whole rendered frame* is static (not just the text) only if
     # every visual parameter is either non-callable, or callable but constant.
     is_frame_dynamic = is_text_dynamic or any(
         callable(v) for v in (font_size, color, outline_color, outline_width, glow_color)
@@ -385,7 +431,7 @@ def text_clip(
             _static_cache[cache_key] = res
         return res
 
-    # Bump maxsize a bit — cheap insurance for scrubbing/seeking, still tiny.
+    # Bump maxsize a bit -- cheap insurance for scrubbing/seeking, still tiny.
     @lru_cache(maxsize=64)
     def render_time_cached(t_key: int) -> np.ndarray:
         t = t_key / 10000.0
@@ -416,11 +462,10 @@ def text_clip(
         text_colored = Image.new("RGBA", (new_w, new_h), cur_color + (255,))
         text_box.paste(text_colored, (0, 0), mask=scaled_text.split()[3])
 
-        # NOTE: no more full-canvas np.zeros((1080,1920,4)) here.
-        # We just return the tight box. blend_clips positions it.
+        # This tight RGBA box IS the frame now -- no more separate rgb/alpha split.
         return np.array(text_box, dtype=np.uint8)
 
-    _static_box = None  # NEW: memoized fully-static result
+    _static_box = None  # memoized fully-static result
 
     def make_rgba_box(t: float) -> np.ndarray:
         nonlocal _static_box
@@ -433,28 +478,20 @@ def text_clip(
         return box
 
     if crop_to_content:
-        def make_rgb_frame(t: float) -> np.ndarray:
-            return make_rgba_box(t)[:, :, :3]
-
-        def make_alpha_frame(t: float) -> np.ndarray:
-            return make_rgba_box(t)[:, :, 3]
-
         sample = make_rgba_box(0.0)  # for declared width/height metadata only
-        alpha_clip_obj = Clip(get_frame=make_alpha_frame, duration=duration)
-        clip = PixelClip(
-            get_frame=make_rgb_frame,
+        clip = Clip(
+            get_frame=make_rgba_box,
             duration=duration,
             width=sample.shape[1],
             height=sample.shape[0],
-            alpha=alpha_clip_obj,
         )
-        # blend_clips reads these via getattr — this is what makes cropping work
+        # blend_clips reads these via getattr -- this is what makes cropping work
         clip.x, clip.y = x, y
         clip.pivot_x, clip.pivot_y = pivot_x, pivot_y
         return clip
 
     # --- legacy path: full-canvas frame, e.g. if you use text_clip standalone
-    # without blend_clips and need a literal (size)-shaped RGB/alpha frame ---
+    # without blend_clips and need a literal (size)-shaped RGBA frame ---
     def make_rgba_frame_full(t: float) -> np.ndarray:
         box = make_rgba_box(t)
         bh, bw = box.shape[:2]
@@ -471,16 +508,11 @@ def text_clip(
             canvas[y1:y2, x1:x2] = box[by1:by2, bx1:bx2]
         return canvas
 
-    def make_rgb_frame_full(t): return make_rgba_frame_full(t)[:, :, :3]
-    def make_alpha_frame_full(t): return make_rgba_frame_full(t)[:, :, 3]
-
-    alpha_clip_obj = Clip(get_frame=make_alpha_frame_full, duration=duration)
-    return PixelClip(
-        get_frame=make_rgb_frame_full,
+    return Clip(
+        get_frame=make_rgba_frame_full,
         duration=duration,
         width=size[0],
         height=size[1],
-        alpha=alpha_clip_obj,
     )
 
 from concurrent.futures import ThreadPoolExecutor
@@ -490,7 +522,7 @@ from tqdm import tqdm
 def detect_best_h264_encoder() -> Tuple[str, dict]:
     """Probes PyAV codecs to detect available GPU hardware acceleration."""
     available_codecs = av.codecs_available
-    
+
     # 1. NVIDIA NVENC
     if "h264_nvenc" in available_codecs:
         try:
@@ -564,6 +596,14 @@ def write_videofile(
     dt = 1.0 / fps
     total_frames = int(clip.duration * fps)
 
+    # Detect the frame's channel layout once by sampling it. Pixel content is
+    # RGBA by convention, but nothing enforces that, so check the real data.
+    # swscale converts either straight to yuv420p in one pass -- an alpha
+    # channel present here is simply dropped during conversion.
+    sample_frame = clip.get_frame(0.0)
+    channels = sample_frame.shape[2] if sample_frame.ndim == 3 else 1
+    src_format = "rgba" if channels == 4 else "rgb24"
+
     # Queue for Threaded Frame Pipeline (Buffers up to 8 frames in RAM)
     frame_queue = queue.Queue(maxsize=8)
 
@@ -571,8 +611,8 @@ def write_videofile(
     def frame_producer():
         for idx in range(total_frames):
             t = idx * dt
-            rgb = clip.get_frame(t)
-            frame_queue.put((idx, rgb))
+            frame = clip.get_frame(t)
+            frame_queue.put((idx, frame))
         frame_queue.put((None, None))  # Sentinel termination signal
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -580,20 +620,20 @@ def write_videofile(
 
         # 2. Main Consumer Loop: Reformat via C libswscale and encode
         pbar = tqdm(total=total_frames, desc=f"Rendering ({encoder_name})", unit="frame")
-        
+
         while True:
-            idx, rgb_frame = frame_queue.get()
+            idx, frame = frame_queue.get()
             if idx is None:
                 break  # Finished
 
-            # Direct C-level RGB -> YUV420P conversion via PyAV C-bindings
-            raw_frame = av.VideoFrame.from_ndarray(rgb_frame, format="rgb24")
+            # Direct C-level RGBA/RGB -> YUV420P conversion via PyAV C-bindings
+            raw_frame = av.VideoFrame.from_ndarray(frame, format=src_format)
             yuv_frame = raw_frame.reformat(width=width, height=height, format="yuv420p")
             yuv_frame.pts = idx
 
             for packet in v_stream.encode(yuv_frame):
                 container.mux(packet)
-            
+
             pbar.update(1)
         pbar.close()
 

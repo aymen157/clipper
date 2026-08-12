@@ -55,10 +55,8 @@ def example_blend():
     video_2 = text_clip(
         text="Cuties !",
         duration=video_1.duration,
-        font_size=lambda t: 50 + 10 * math.sin(t * 4), # Bouncing size
+        font_size=lambda t: 200 + 10 * math.sin(t * 4), # Bouncing size
         color=(255, 255, 255),
-        glow_color=(255, 100, 0),
-        glow_radius=10.0,
         size=(700, 400)
     )
 
@@ -74,4 +72,29 @@ def example_blend():
     )
 
 
-example_blend()
+def example_blend_delayed():
+    video_1 = video_file_clip(r"tests/11650608-hd_1920_1080_30fps.mp4")
+
+    video_2 = text_clip(
+        text="Thank you for watching !",
+        duration=5,
+        font_size=100, # Bouncing size
+        color=(255, 255, 255),
+        size=(500, 400)
+    )
+    video_2.delay = video_1.duration - video_2.duration
+    video_2 = fade_in(video_2, duration=.2)
+
+    video = blend_clips([video_1, video_2])
+    # we fade rgb bc the clip has an alpha but the export doesn't export alphas as black.
+    video = fade_in(video, duration=1.5, fade_rgb=True)
+    video = fade_out(video, duration=.5, fade_rgb=True)
+
+    write_videofile(
+        clip=video,
+        output_path="tests/output.mp4",
+        fps=30,
+    )
+
+
+example_blend_delayed()
