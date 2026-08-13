@@ -110,4 +110,31 @@ def example_audio_video_mix():
     )
 
 
-example_audio_video_mix()
+def example_gallery():
+    from pathlib import Path
+    DURATION_PER_IMAGE = 3.0
+    FADE_DURATION = 0.1
+    images = []
+    for i, path in enumerate(Path(r"tests/gallery_1").glob("*.jpg")):
+        full_path = path.resolve()
+        img = image_file_clip(full_path, duration=DURATION_PER_IMAGE)
+        img.delay = (DURATION_PER_IMAGE - FADE_DURATION) * i
+        img = object_fit(
+            img, 
+            container_width=1080, 
+            container_height=1920, 
+            mode="cover"
+        )
+        img = fade_in(img, duration=FADE_DURATION)
+        images.append(img)
+
+    video = blend_clips(images, size=(1080, 1920))
+    write_videofile(
+        clip=video,
+        # audio_clip=audio,
+        output_path="tests/output.mp4",
+        fps=30,
+    )
+
+
+example_gallery()

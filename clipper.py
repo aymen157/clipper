@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import av
 
+# SCALE_FACTOR: float = 1.0
+
 class Clip:
     """Class representing a time-bound stream of frames.
 
@@ -518,6 +520,16 @@ def text_clip(
         height=size[1],
     )
 
+
+
+
+
+
+
+
+
+
+
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
@@ -561,7 +573,6 @@ from typing import Optional
 import av
 from tqdm import tqdm
 
-
 def write_videofile(
     clip: "Clip",
     output_path: str,
@@ -577,7 +588,6 @@ def write_videofile(
     width = width if width % 2 == 0 else width - 1
     height = height if height % 2 == 0 else height - 1
 
-    # Auto-detect best GPU or CPU Encoder
     if custom_encoder:
         encoder_name, encoder_opts = custom_encoder, {"threads": "auto"}
     else:
@@ -600,17 +610,7 @@ def write_videofile(
     if audio_clip is not None:
         a_stream = container.add_stream("aac", rate=audio_clip.sample_rate)
         
-        # Dynamic layout mapping (PyAV v10+ compatible)
-        layout_map = {
-            1: "mono",
-            2: "stereo",
-            3: "2.1",
-            4: "4.0",
-            6: "5.1",
-            8: "7.1"
-        }
-        
-        # Use from_channels() for safe fallback if channel count isn't in common map
+        layout_map = {1: "mono", 2: "stereo", 3: "2.1", 4: "4.0", 6: "5.1", 8: "7.1"}
         if audio_clip.channels in layout_map:
             a_stream.layout = layout_map[audio_clip.channels]
         else:
@@ -623,34 +623,42 @@ def write_videofile(
     dt = 1.0 / fps
     total_frames = int(clip.duration * fps)
 
-    # Detect the frame's channel layout once by sampling it.
     sample_frame = clip.get_frame(0.0)
     channels = sample_frame.shape[2] if sample_frame.ndim == 3 else 1
     src_format = "rgba" if channels == 4 else "rgb24"
 
-    # Queue for Threaded Frame Pipeline (Buffers up to 8 frames in RAM)
     frame_queue = queue.Queue(maxsize=8)
 
-    # 1. Producer Thread: Fetch frames from Clip concurrently
+    # 1. Producer Thread: Catch exceptions and pass them to consumer
     def frame_producer():
-        for idx in range(total_frames):
-            t = idx * dt
-            frame = clip.get_frame(t)
-            frame_queue.put((idx, frame))
-        frame_queue.put((None, None))  # Sentinel termination signal
+        try:
+            for idx in range(total_frames):
+                t = idx * dt
+                frame = clip.get_frame(t)
+                frame_queue.put((idx, frame))
+            frame_queue.put((None, None))  # Success sentinel
+        except Exception as e:
+            # Send exception down the queue so main thread re-raises it!
+            frame_queue.put(("ERROR", e))
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        executor.submit(frame_producer)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(frame_producer)
 
-        # 2. Main Consumer Loop: Reformat via C libswscale and encode
         pbar = tqdm(total=total_frames, desc=f"Rendering ({encoder_name})", unit="frame")
 
         while True:
-            idx, frame = frame_queue.get()
-            if idx is None:
-                break  # Finished
+            idx, item = frame_queue.get()
+            
+            # Catch exceptions from producer thread
+            if idx == "ERROR":
+                pbar.close()
+                container.close()
+                raise item  # <-- THIS WILL PRINT THE EXACT ERROR INSTEAD OF FREEZING!
 
-            # Direct C-level RGBA/RGB -> YUV420P conversion via PyAV C-bindings
+            if idx is None:
+                break  # Finished cleanly
+
+            frame = item
             raw_frame = av.VideoFrame.from_ndarray(frame, format=src_format)
             yuv_frame = raw_frame.reformat(width=width, height=height, format="yuv420p")
             yuv_frame.pts = idx
@@ -668,7 +676,6 @@ def write_videofile(
     # --- ENCODE AUDIO IN STREAMED CHUNKS ---
     if audio_clip is not None and a_stream is not None and fifo is not None:
         chunk_duration = 1.0
-        # Sync chunk layout with audio stream layout
         layout = a_stream.layout.name
         num_chunks = math.ceil(audio_clip.duration / chunk_duration)
         frame_pts = 0
@@ -687,7 +694,6 @@ def write_videofile(
             audio_frame.rate = audio_clip.sample_rate
             fifo.write(audio_frame)
 
-            # Extract exact 1024-sample packets required by AAC
             while fifo.samples >= 1024:
                 out_frame = fifo.read(1024)
                 out_frame.pts = frame_pts
@@ -696,7 +702,6 @@ def write_videofile(
                 for packet in a_stream.encode(out_frame):
                     container.mux(packet)
 
-        # Flush Audio FIFO
         if fifo.samples > 0:
             out_frame = fifo.read(fifo.samples)
             out_frame.pts = frame_pts

@@ -1,4 +1,12 @@
 from clipper import *
+from typing import Callable, Optional, TypeVar, Union, Literal
+import cv2 # more performant than PIL
+
+T = TypeVar("T")
+ValueOrCallable = Union[T, Callable[[float], T]]
+def resolve_val(val: ValueOrCallable[T], t: float) -> T:
+    """Helper to resolve a value whether it's static or time-dependent."""
+    return val(t) if callable(val) else val
 
 
 def _is_rgba(frame: np.ndarray) -> bool:
@@ -145,8 +153,6 @@ def trim(
     return trimmed
 
 
-from typing import Literal
-
 # this is used to create looping videos
 def extend(
     clip: Clip,
@@ -200,17 +206,17 @@ def extend(
 
 def resize(
     clip: Clip,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
+    width: Optional[ValueOrCallable[int]] = None,
+    height: Optional[ValueOrCallable[int]] = None,
     keep_aspect: bool = True,
-    aspect: Optional[float] = None,
+    aspect: Optional[ValueOrCallable[float]] = None,
 ) -> Clip:
     """Resizes a Clip to target dimensions.
 
     Args:
         clip: The Clip instance to resize.
-        width: Target width in pixels.
-        height: Target height in pixels.
+        width: Target width in pixels, or a callable mapping time `t` to pixels.
+        height: Target height in pixels, or a callable mapping time `t` to pixels.
         keep_aspect: If True, calculates missing dimensions or adjusts dimensions
           to maintain the aspect ratio.
         aspect: Optional explicit aspect ratio (width / height). If None, it is
@@ -236,47 +242,98 @@ def resize(
         sample_frame = clip.get_frame(0.0)
         orig_h, orig_w = sample_frame.shape[:2]
 
-    # 2. Determine target aspect ratio
-    if aspect is None:
-        aspect = float(orig_w) / float(orig_h)
+    # Helper function to compute dimensions at time t
+    def resolve_dimensions(t: float) -> tuple[int, int]:
+        # Evaluate parameters at frame time t
+        cur_width = resolve_val(width, t)
+        cur_height = resolve_val(height, t)
+        cur_aspect = resolve_val(aspect, t)
 
-    # 3. Calculate target target width and height
-    if width is None and height is None:
-        target_w, target_h = orig_w, orig_h
+        # 2. Determine target aspect ratio
+        if cur_aspect is None:
+            cur_aspect = float(orig_w) / float(orig_h)
 
-    elif width is not None and height is None:
-        target_w = width
-        target_h = int(round(width / aspect)) if keep_aspect else orig_h
+        # 3. Calculate target width and height
+        if cur_width is None and cur_height is None:
+            target_w, target_h = orig_w, orig_h
 
-    elif height is not None and width is None:
-        target_h = height
-        target_w = int(round(height * aspect)) if keep_aspect else orig_w
+        elif cur_width is not None and cur_height is None:
+            target_w = cur_width
+            target_h = int(round(cur_width / cur_aspect)) if keep_aspect else orig_h
 
-    else:  # Both width and height provided
-        if keep_aspect:
-            # Fit inside the bounding box (width x height) while preserving aspect ratio
-            if (width / height) > aspect:
-                target_h = height
-                target_w = int(round(height * aspect))
+        elif cur_height is not None and cur_width is None:
+            target_h = cur_height
+            target_w = int(round(cur_height * cur_aspect)) if keep_aspect else orig_w
+
+        else:  # Both width and height provided
+            if keep_aspect:
+                # Fit inside the bounding box (width x height) while preserving aspect ratio
+                if (cur_width / cur_height) > cur_aspect:
+                    target_h = cur_height
+                    target_w = int(round(cur_height * cur_aspect))
+                else:
+                    target_w = cur_width
+                    target_h = int(round(cur_width / cur_aspect))
             else:
-                target_w = width
-                target_h = int(round(width / aspect))
-        else:
-            target_w = width
-            target_h = height
+                target_w = cur_width
+                target_h = cur_height
 
-    # Ensure valid non-zero dimensions
-    target_w = max(1, target_w)
-    target_h = max(1, target_h)
+        # Ensure valid non-zero dimensions
+        target_w = max(1, int(target_w))
+        target_h = max(1, int(target_h))
+
+        return target_w, target_h
+
+    # Fast path optimization: if dimensions are static, resolve them once upfront
+    is_dynamic = callable(width) or callable(height) or callable(aspect)
+    initial_w, initial_h = resolve_dimensions(0.0)
 
     # 4. Frame transformation
     def make_frame(t: float) -> np.ndarray:
+        target_w, target_h = resolve_dimensions(t) if is_dynamic else (initial_w, initial_h)
         frame = clip.get_frame(t)
         img = Image.fromarray(frame)
         resized_img = img.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
         return np.array(resized_img, dtype=np.uint8)
 
-    return clip.derive(get_frame=make_frame, width=target_w, height=target_h)
+    return clip.derive(
+        get_frame=make_frame,
+        width=None if is_dynamic else initial_w,
+        height=None if is_dynamic else initial_h,
+    )
+
+
+def rescale(clip: Clip, scale: ValueOrCallable[float]) -> Clip:
+    """Rescales a Clip by a given floating-point multiplier factor or time function.
+
+    Args:
+        clip: The Clip instance to rescale.
+        scale: Scaling multiplier (e.g. 1.5), or a callable mapping time `t` 
+               to a multiplier (e.g. lambda t: 1 + 0.1 * t).
+
+    Returns:
+        A new Clip scaled dynamically or statically.
+    """
+    orig_w = getattr(clip, "width", None)
+    orig_h = getattr(clip, "height", None)
+
+    if orig_w is None or orig_h is None:
+        sample_frame = clip.get_frame(0.0)
+        orig_h, orig_w = sample_frame.shape[:2]
+
+    # Convert scale into dynamic width and height functions
+    if callable(scale):
+        width_fn = lambda t: int(round(orig_w * scale(t)))
+        height_fn = lambda t: int(round(orig_h * scale(t)))
+        return resize(clip, width=width_fn, height=height_fn, keep_aspect=False)
+
+    else:
+        if scale <= 0:
+            raise ValueError("Scale factor must be greater than 0.")
+        new_w = int(round(orig_w * scale))
+        new_h = int(round(orig_h * scale))
+        return resize(clip, width=new_w, height=new_h, keep_aspect=False)
+
 
 
 def concat(clips: list[Clip]) -> Clip:
@@ -514,4 +571,172 @@ def blend_clips(
         duration=total_duration,
         width=width,
         height=height,
+    )
+
+
+
+
+FitMode = Literal["fill", "contain", "cover", "none", "scale-down"]
+PositionAlignment = Union[
+    Literal["center", "top", "bottom", "left", "right", 
+            "top left", "top right", "bottom left", "bottom right"],
+    Tuple[float, float]
+]
+
+def _parse_position(pos: PositionAlignment) -> Tuple[float, float]:
+    if isinstance(pos, tuple):
+        return pos
+    pos_str = pos.lower().strip()
+    x_pct = 0.0 if "left" in pos_str else (1.0 if "right" in pos_str else 0.5)
+    y_pct = 0.0 if "top" in pos_str else (1.0 if "bottom" in pos_str else 0.5)
+    return x_pct, y_pct
+
+
+def object_fit(
+    clip: Clip,
+    container_width: ValueOrCallable[int],
+    container_height: ValueOrCallable[int],
+    mode: ValueOrCallable[FitMode] = "contain",
+    position: ValueOrCallable[PositionAlignment] = "center",
+    bg_color: ValueOrCallable[Tuple[int, ...]] = (0, 0, 0, 0),
+) -> Clip:
+    orig_w = getattr(clip, "width", None)
+    orig_h = getattr(clip, "height", None)
+
+    if orig_w is None or orig_h is None:
+        sample_frame = clip.get_frame(0.0)
+        orig_h, orig_w = sample_frame.shape[:2]
+
+    is_dynamic = (
+        callable(container_width)
+        or callable(container_height)
+        or callable(mode)
+        or callable(position)
+        or callable(bg_color)
+    )
+
+    # CRITICAL FIX 2: Frame Caching for Static Clips (Images)
+    _cached_raw_frame_id: Optional[int] = None
+    _cached_result_frame: Optional[np.ndarray] = None
+    _cached_params: Optional[Tuple] = None
+
+    def process_frame_at_time(t: float) -> np.ndarray:
+        nonlocal _cached_raw_frame_id, _cached_result_frame, _cached_params
+
+        frame = clip.get_frame(t)
+
+        c_w = int(resolve_val(container_width, t))
+        c_h = int(resolve_val(container_height, t))
+        cur_mode = resolve_val(mode, t)
+        cur_pos = resolve_val(position, t)
+        cur_bg = resolve_val(bg_color, t)
+
+        current_params = (c_w, c_h, cur_mode, cur_pos, cur_bg)
+
+        # Check if the source frame array & parameters haven't changed (static image)
+        frame_id = id(frame)
+        if (
+            not is_dynamic 
+            and _cached_raw_frame_id == frame_id 
+            and _cached_params == current_params
+            and _cached_result_frame is not None
+        ):
+            return _cached_result_frame
+
+        x_pct, y_pct = _parse_position(cur_pos)
+
+        # 1. 'cover' mode optimization
+        if cur_mode == "cover":
+            src_aspect = orig_w / orig_h
+            dst_aspect = c_w / c_h
+
+            if dst_aspect > src_aspect:
+                crop_h = int(round(orig_w / dst_aspect))
+                crop_w = orig_w
+            else:
+                crop_w = int(round(orig_h * dst_aspect))
+                crop_h = orig_h
+
+            crop_x = int(round((orig_w - crop_w) * x_pct))
+            crop_y = int(round((orig_h - crop_h) * y_pct))
+
+            cropped_frame = frame[crop_y : crop_y + crop_h, crop_x : crop_x + crop_w]
+            out = cv2.resize(cropped_frame, (c_w, c_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # Update cache
+            _cached_raw_frame_id = frame_id
+            _cached_params = current_params
+            _cached_result_frame = out
+            return out
+
+        # 2. Compute sizing for contain / fill / none / scale-down
+        if cur_mode == "fill":
+            render_w, render_h = c_w, c_h
+        elif cur_mode in ("contain", "scale-down"):
+            src_aspect = orig_w / orig_h
+            dst_aspect = c_w / c_h
+
+            if cur_mode == "scale-down" and orig_w <= c_w and orig_h <= c_h:
+                render_w, render_h = orig_w, orig_h
+            else:
+                if dst_aspect > src_aspect:
+                    render_h = c_h
+                    render_w = int(round(c_h * src_aspect))
+                else:
+                    render_w = c_w
+                    render_h = int(round(c_w / src_aspect))
+        else:  # "none"
+            render_w, render_h = orig_w, orig_h
+
+        # 3. Fast resize
+        if (render_w, render_h) != (orig_w, orig_h):
+            resized = cv2.resize(frame, (render_w, render_h), interpolation=cv2.INTER_LANCZOS4)
+        else:
+            resized = frame
+
+        # 4. Canvas creation & Direct Slicing
+        has_alpha = frame.ndim == 3 and frame.shape[2] == 4
+        num_channels = 4 if (has_alpha or len(cur_bg) == 4) else 3
+
+        canvas = np.full((c_h, c_w, num_channels), cur_bg[:num_channels], dtype=np.uint8)
+
+        off_x = int(round((c_w - render_w) * x_pct))
+        off_y = int(round((c_h - render_h) * y_pct))
+
+        c_x1 = max(0, off_x)
+        c_y1 = max(0, off_y)
+        c_x2 = min(c_w, off_x + render_w)
+        c_y2 = min(c_h, off_y + render_h)
+
+        r_x1 = max(0, -off_x)
+        r_y1 = max(0, -off_y)
+        r_x2 = r_x1 + (c_x2 - c_x1)
+        r_y2 = r_y1 + (c_y2 - c_y1)
+
+        if c_x2 > c_x1 and c_y2 > c_y1:
+            src_patch = resized[r_y1:r_y2, r_x1:r_x2]
+
+            if num_channels == 3 or src_patch.shape[2] == 3:
+                canvas[c_y1:c_y2, c_x1:c_x2, : src_patch.shape[2]] = src_patch
+            else:
+                alpha = src_patch[..., 3:] / 255.0
+                canvas_patch = canvas[c_y1:c_y2, c_x1:c_x2]
+                canvas_patch[..., :3] = (
+                    src_patch[..., :3] * alpha + canvas_patch[..., :3] * (1.0 - alpha)
+                ).astype(np.uint8)
+                canvas_patch[..., 3] = np.maximum(canvas_patch[..., 3], src_patch[..., 3])
+
+        # Update cache
+        _cached_raw_frame_id = frame_id
+        _cached_params = current_params
+        _cached_result_frame = canvas
+        return canvas
+
+    init_w = int(resolve_val(container_width, 0.0))
+    init_h = int(resolve_val(container_height, 0.0))
+
+    return clip.derive(
+        get_frame=process_frame_at_time,
+        width=None if is_dynamic else init_w,
+        height=None if is_dynamic else init_h,
     )
