@@ -283,16 +283,15 @@ def video_file_clip(file_path: str) -> Clip:
     clip.file_path = file_path
     return clip
 
-import av
-import numpy as np
 
 def audio_file_clip(file_path: str, sample_rate: int = 44100, channels: int = 2) -> AudioClip:
     """Decodes full audio into a NumPy array up front (Zero seek-glitches, ultra fast)."""
     container = av.open(file_path)
     stream = container.streams.audio[0]
     
+    # Request standard interleaved float32 ('flt') instead of planar ('fltp')
     resampler = av.AudioResampler(
-        format='fltp',
+        format='flt',
         layout='stereo' if channels == 2 else 'mono',
         rate=sample_rate,
     )
@@ -301,43 +300,56 @@ def audio_file_clip(file_path: str, sample_rate: int = 44100, channels: int = 2)
     for packet in container.demux(stream):
         for frame in packet.decode():
             for r_frame in resampler.resample(frame):
-                chunks.append(r_frame.to_ndarray())
+                # r_frame.to_ndarray() with 'flt' format gives (1, total_samples * channels)
+                # Reshape to (num_samples, channels) immediately
+                arr = r_frame.to_ndarray()
+                if arr.ndim == 2 and arr.shape[0] == 1:
+                    arr = arr.reshape(-1, channels)
+                chunks.append(arr)
                 
     for r_frame in resampler.resample(None): # flush
-        chunks.append(r_frame.to_ndarray())
+        arr = r_frame.to_ndarray()
+        if arr.ndim == 2 and arr.shape[0] == 1:
+            arr = arr.reshape(-1, channels)
+        chunks.append(arr)
         
     container.close()
     
-    # Full audio array in memory: shape (channels, total_samples)
-    data = np.concatenate(chunks, axis=1) if chunks else np.zeros((channels, 0), dtype=np.float32)
-    duration = data.shape[1] / sample_rate
+    # Unified Internal Standard: Shape (total_samples, channels) -> e.g., (N, 2)
+    if chunks:
+        data = np.concatenate(chunks, axis=0)
+    else:
+        data = np.zeros((0, channels), dtype=np.float32)
+
+    duration = data.shape[0] / sample_rate
 
     def get_samples(t_start: float, fetch_duration: float) -> np.ndarray:
-        start_idx = int(t_start * sample_rate)
-        num_samples = int(fetch_duration * sample_rate)
+        start_idx = int(round(t_start * sample_rate))
+        num_samples = int(round(fetch_duration * sample_rate))
         end_idx = start_idx + num_samples
         
         # Out-of-bounds safety check
-        if start_idx >= data.shape[1] or end_idx < 0:
-            return np.zeros((channels, num_samples), dtype=np.float32)
+        if start_idx >= data.shape[0] or end_idx <= 0:
+            return np.zeros((num_samples, channels), dtype=np.float32)
             
         # Pad if bounds extend past array edges
         pad_left = max(0, -start_idx)
-        pad_right = max(0, end_idx - data.shape[1])
+        pad_right = max(0, end_idx - data.shape[0])
         
         valid_start = max(0, start_idx)
-        valid_end = min(data.shape[1], end_idx)
+        valid_end = min(data.shape[0], end_idx)
         
-        slice_data = data[:, valid_start:valid_end]
+        slice_data = data[valid_start:valid_end]
         
         if pad_left > 0 or pad_right > 0:
-            slice_data = np.pad(slice_data, ((0, 0), (pad_left, pad_right)), mode='constant')
+            slice_data = np.pad(slice_data, ((pad_left, pad_right), (0, 0)), mode='constant')
             
-        return slice_data
+        return slice_data  # Always returns shape (fetch_samples, channels)
 
     clip = AudioClip(get_samples=get_samples, duration=duration, sample_rate=sample_rate, channels=channels)
     clip.file_path = file_path
     return clip
+
 
 T = TypeVar('T')
 ValueOrCallable = Union[T, Callable[[float], T]]
@@ -687,10 +699,14 @@ def write_videofile(
                 break
 
             samples = audio_clip.get_samples(t_start, current_duration)
-            if samples.shape[1] == 0:
+            if samples.shape[0] == 0:
                 continue
 
-            audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
+            # Convert from internal standard (samples, channels) -> planar (channels, samples)
+            # required by PyAV's `fltp` AudioFrame format.
+            planar_samples = np.ascontiguousarray(samples.T.astype(np.float32))
+
+            audio_frame = av.AudioFrame.from_ndarray(planar_samples, format="fltp", layout=layout)
             audio_frame.rate = audio_clip.sample_rate
             fifo.write(audio_frame)
 
