@@ -142,7 +142,7 @@ def example_whisperx():
     # Video clip from "watch?v=SF5wWMC6kuw", downloaded using yt-dlp
     # whisperx command used on that video:
     # whisperx 'cutscene.mp4' --model small --compute_type int8 --output_format json --highlight_words True
-    movie = 'test_data/whisperx/LEGEND (2015) Reggie threatens with a gun ｜ Scene (FHD) [SF5wWMC6kuw].mp4'
+    movie = 'test_data/whisperx/LEGEND (2015) Reggie threatens with a gun Scene (FHD) - KinoClip HD (1080p).mp4'
     whisperx_json = 'test_data/whisperx/LEGEND (2015) Reggie threatens with a gun ｜ Scene (FHD) [SF5wWMC6kuw].json'
     video = video_file_clip(movie)
     audio = audio_file_clip(movie)
