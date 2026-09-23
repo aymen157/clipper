@@ -98,6 +98,8 @@ processed = volume(boosted, factor=lambda t: min(1.0, t / 2.0))
 
 # technical details
 
+None of the editing functions (like fade-in, inverts etc..) alter the underlying audio or video data in memory, and they also don't bake in or destructive-render any artifacts at the moment you call them. Both do <b>deferred / lazy computation wrappers.</b>
+
 Video is <b>streamed</b> from disk, frame by frame. the filters applied over frame at time t.
 
 Audios are <b>loaded entirely into memory</b>. (because small memory footprint, but also not loading it leads to Codec Pre-roll & Windowing which in turn leads to jagged/bumps in output if we edit it on the fly from reads from disk. Sample-Exact Slicing vs. Keyframe Seeking etc..)
